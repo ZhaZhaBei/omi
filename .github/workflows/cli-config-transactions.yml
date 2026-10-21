@@ -1,0 +1,194 @@
+name: Omi CLI config transaction validation
+
+on:
+  push:
+    branches: [validation/omi-cli-22972-20261021]
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    name: SDK / ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: Linux Python 3.10, os: ubuntu-latest, python: '3.10', id: linux310}
+          - {label: Linux Python 3.12, os: ubuntu-latest, python: '3.12', id: linux312}
+          - {label: Windows Python 3.12, os: windows-latest, python: '3.12', id: windows312}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source/sdks/python-cli
+    env:
+      OMI_CONFIG: ${{ runner.temp }}/omi-cli-validation/config.toml
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout validation package
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: ci-package
+          persist-credentials: false
+      - name: Checkout fixed public source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          repository: BasedHardware/omi
+          ref: d6b734be95c367a1c5750d342ab2bee094d47265
+          path: source
+          fetch-depth: 1
+          sparse-checkout: |
+            sdks/python-cli
+            docs/api-reference
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify and apply reviewed five-file patch
+        working-directory: source
+        run: |
+          python - <<'PYCODE'
+          import hashlib, os
+          from pathlib import Path
+          patch = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-package' / 'changes.patch'
+          assert hashlib.sha256(patch.read_bytes()).hexdigest() == '76ce279408900ba2e716500cf8749b5f0bb006bdeed2892c61a9fdc6961d55f1'
+          contract = Path('docs/api-reference/openapi.json')
+          assert hashlib.sha256(contract.read_bytes()).hexdigest() == '9db4996476277363f8d2d3ce4b45a58c7919b5917cb7ef28ce94572a7b4933c8'
+          PYCODE
+          test "$(git rev-parse HEAD)" = 'd6b734be95c367a1c5750d342ab2bee094d47265'
+          git config core.autocrlf false
+          git apply --check ../ci-package/changes.patch
+          git apply --index ../ci-package/changes.patch
+          python - <<'PYCODE'
+          import hashlib
+          from pathlib import Path
+          expected = {'sdks/python-cli/omi_cli/config.py': 'fce956f67c90d21c2eaf2a050cf66e11ed40b61e46fdac2e3406fc69d574d39b', 'sdks/python-cli/omi_cli/auth/store.py': '1f597e35f987d3de19b652d113e17d0327898eb75981c5c6d97021544de93099', 'sdks/python-cli/omi_cli/commands/config.py': 'af686c8f4c8fcd68e06f0c38fc99ea1ac8a16467114fce80c76b2b8aa7d75a19', 'sdks/python-cli/omi_cli/commands/local.py': '582405198354a5c49b3f0c1472c88fcdc85ad33415dbbfc90c79833fa8a50587', 'sdks/python-cli/tests/test_config_transactions.py': '4ce9bb78d60f1b052945f673aa771a3e901a17a81b15d8e349691e58ccd1aa27'}
+          for name, digest in expected.items():
+              actual = hashlib.sha256(Path(name).read_bytes()).hexdigest()
+              assert actual == digest, name
+              print(f'{actual}  {name}')
+          PYCODE
+          git diff --cached --check
+          git diff --cached --stat
+      - name: Install SDK and declared test dependencies
+        run: |
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m pip list --format=freeze
+      - name: Run the complete CLI suite with synthetic fixtures
+        run: python -m pytest -q --basetemp "${RUNNER_TEMP}/omi-cli-pytest-${{ matrix.id }}"
+      - name: Build wheel and verify a clean install
+        if: matrix.id == 'linux312'
+        run: |
+          python -m build --wheel --outdir dist
+          bash verify-clean-install.sh dist
+          python - <<'PYCODE'
+          import hashlib
+          from pathlib import Path
+          for wheel in Path('dist').glob('*.whl'):
+              print(hashlib.sha256(wheel.read_bytes()).hexdigest(), wheel.name)
+          PYCODE
+
+  preflight:
+    name: Full repository preflight / Linux Python 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      GIT_CONFIG_COUNT: '2'
+      GIT_CONFIG_KEY_0: user.name
+      GIT_CONFIG_VALUE_0: ZhaZhaBei
+      GIT_CONFIG_KEY_1: user.email
+      GIT_CONFIG_VALUE_1: 203745378+ZhaZhaBei@users.noreply.github.com
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout validation package
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: ci-package
+          persist-credentials: false
+      - name: Checkout full public source and complete commit history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: BasedHardware/omi
+          ref: d6b734be95c367a1c5750d342ab2bee094d47265
+          path: source
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Apply the same patch and make an ephemeral local commit
+        run: |
+          test "$(git rev-parse HEAD)" = 'd6b734be95c367a1c5750d342ab2bee094d47265'
+          python - <<'PYCODE'
+          import hashlib, os
+          from pathlib import Path
+          patch = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-package' / 'changes.patch'
+          assert hashlib.sha256(patch.read_bytes()).hexdigest() == '76ce279408900ba2e716500cf8749b5f0bb006bdeed2892c61a9fdc6961d55f1'
+          PYCODE
+          git apply --check ../ci-package/changes.patch
+          git apply --index ../ci-package/changes.patch
+          python - <<'PYCODE'
+          import hashlib, subprocess
+          from pathlib import Path
+          expected = {'sdks/python-cli/omi_cli/config.py': 'fce956f67c90d21c2eaf2a050cf66e11ed40b61e46fdac2e3406fc69d574d39b', 'sdks/python-cli/omi_cli/auth/store.py': '1f597e35f987d3de19b652d113e17d0327898eb75981c5c6d97021544de93099', 'sdks/python-cli/omi_cli/commands/config.py': 'af686c8f4c8fcd68e06f0c38fc99ea1ac8a16467114fce80c76b2b8aa7d75a19', 'sdks/python-cli/omi_cli/commands/local.py': '582405198354a5c49b3f0c1472c88fcdc85ad33415dbbfc90c79833fa8a50587', 'sdks/python-cli/tests/test_config_transactions.py': '4ce9bb78d60f1b052945f673aa771a3e901a17a81b15d8e349691e58ccd1aa27'}
+          staged = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert staged == set(expected), sorted(staged)
+          for name, digest in expected.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, name
+          PYCODE
+          git diff --cached --check
+          git switch -c validation/applied-cli-config-transactions
+          git commit -m 'fix(cli): serialize config read-modify-write transactions'
+          git update-ref refs/remotes/origin/main 'd6b734be95c367a1c5750d342ab2bee094d47265'
+          git log -1 --format='Local validation commit: %H%nAuthor: %an <%ae>'
+      - name: Generate invariant citations and review metadata outside the source tree
+        run: |
+          PYTHON="$(command -v python)" bash scripts/pr-preflight --lane local --base 'd6b734be95c367a1c5750d342ab2bee094d47265' --suggest > "${RUNNER_TEMP}/omi-preflight-suggestion.md"
+          python - <<'PYCODE'
+          import os
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          suggestion = (temp / 'omi-preflight-suggestion.md').read_text()
+          invariant_section = suggestion.split('## Failure class (fixes)', 1)[0].strip()
+          assert invariant_section.startswith('## Product invariants affected'), suggestion
+          assert 'Failure-Class:' not in invariant_section, invariant_section
+          body = (
+              'Fixes #22972\n\n'
+              'Serialize CLI configuration read-modify-write operations using a stable sibling lock and freshly loaded state. '
+              'Migrate credential, profile and local configuration writers together, keeping network requests and prompts outside the lock. '
+              'Add synthetic process-level regression tests for retained writes and lock release.\n\n'
+              'Validation: this separate fork artifact applies the reviewed five-file patch to the fixed public base. '
+              'SDK matrix jobs run the complete CLI suite; this job executes formal repository preflight on an ephemeral local commit. '
+              'It is not an upstream PR exact-head CI result.\n\n'
+              'AI assistance: OpenAI Codex. No independent human technical review is claimed.\n\n'
+              + invariant_section + '\n\nFailure-Class: FC-cache-merge-write-race\n'
+          )
+          (temp / 'omi-preflight-pr-body.md').write_text(body)
+          print(body)
+          PYCODE
+      - name: Run the formal repository preflight
+        run: |
+          PYTHON="$(command -v python)" OMI_PR_BODY_FILE="${RUNNER_TEMP}/omi-preflight-pr-body.md" make preflight 2>&1 | tee "${RUNNER_TEMP}/omi-full-preflight.log"
+          python - <<'PYCODE'
+          import os
+          from pathlib import Path
+          log = (Path(os.environ['RUNNER_TEMP']) / 'omi-full-preflight.log').read_text()
+          skipped = [line for line in log.splitlines() if 'SKIP' in line or 'skipped' in line.lower()]
+          print('Preflight skip notices (must not be reported as executed checks):')
+          print('\n'.join(skipped) if skipped else '(none)')
+          PYCODE
