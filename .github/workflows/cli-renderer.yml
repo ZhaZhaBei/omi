@@ -1,0 +1,97 @@
+name: Omi CLI renderer validation
+on:
+  push:
+    branches: [validation/omi-cli-renderer-18721-20261024]
+permissions:
+  contents: read
+jobs:
+  cli:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    env:
+      OMI_CONFIG: ${{ github.workspace }}/renderer-validation/config.toml
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout reviewed validation package
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: validation-package
+          persist-credentials: false
+      - name: Checkout fixed public base with full history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: BasedHardware/omi
+          ref: 251892e223fca3bf5c90f060d3b9673683e258fa
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify exact source commit and reviewed patch
+        working-directory: source
+        run: |
+          python - <<'PYCODE'
+          import hashlib,json,pathlib,subprocess
+          p=pathlib.Path('../validation-package');m=json.loads((p/'manifest.json').read_text())
+          def git(*a):return subprocess.check_output(['git',*a]).decode().strip()
+          assert git('rev-parse','HEAD')==m['base']
+          assert git('rev-parse','--is-shallow-repository')=='false'
+          assert hashlib.sha256((p/'changes.patch').read_bytes()).hexdigest()==m['patch_sha256']
+          subprocess.run(['git','apply','--check',str(p/'changes.patch')],check=True)
+          subprocess.run(['git','apply','--index',str(p/'changes.patch')],check=True)
+          assert git('write-tree')==m['tree']
+          assert git('hash-object','-t','commit','-w',str(p/'source-commit.txt'))==m['head']
+          subprocess.run(['git','checkout','--detach',m['head']],check=True)
+          subprocess.run(['git','update-ref','refs/remotes/origin/main',m['base']],check=True)
+          for name,digest in m['source_files_sha256'].items():
+              assert hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()==digest,name
+          assert not git('status','--porcelain')
+          print('Verified exact source HEAD:',git('rev-parse','HEAD'))
+          PYCODE
+      - name: Install declared compatible development dependencies
+        working-directory: source/sdks/python-cli
+        run: |
+          python -m pip install -e '.[dev]' 'click==8.5.0' 'tomli>=2.0'
+          python -m pip list --format=freeze
+      - name: Run complete CLI suite
+        working-directory: source/sdks/python-cli
+        run: python -m pytest -q --junitxml "${RUNNER_TEMP}/renderer-pytest.xml"
+      - name: Check format and types
+        working-directory: source/sdks/python-cli
+        run: |
+          python -m black --check omi_cli/output.py tests/test_output_types.py
+      - name: Typecheck in declared compatible dependency environment
+        if: matrix.python == '3.12'
+        working-directory: source/sdks/python-cli
+        run: |
+          python -m venv "${RUNNER_TEMP}/renderer-typecheck"
+          "${RUNNER_TEMP}/renderer-typecheck/bin/python" -m pip install -e '.[dev]' 'click==8.1.8' 'typer==0.23.1' 'tomli>=2.0'
+          "${RUNNER_TEMP}/renderer-typecheck/bin/python" -m mypy omi_cli
+      - name: Build and verify both clean package installs
+        if: matrix.python == '3.12'
+        working-directory: source/sdks/python-cli
+        run: |
+          python -m build
+          python -m twine check dist/*
+          bash verify-clean-install.sh dist
+      - name: Full-history preflight and PR metadata
+        if: matrix.python == '3.12'
+        working-directory: source
+        env:
+          PYTHON: python
+          OMI_PR_BODY_FILE: ${{ github.workspace }}/validation-package/pr-body.md
+        run: |
+          scripts/pr-preflight --suggest
+          make preflight 2>&1 | tee "${RUNNER_TEMP}/renderer-preflight.log"
+          if grep -q '^SKIP' "${RUNNER_TEMP}/renderer-preflight.log"; then exit 1; fi
+          scripts/pr-preflight --pr-body-file "$OMI_PR_BODY_FILE" 2>&1 | tee "${RUNNER_TEMP}/renderer-metadata.log"
+          if grep -q '^SKIP' "${RUNNER_TEMP}/renderer-metadata.log"; then exit 1; fi

@@ -1,0 +1,11 @@
+{
+  "head": "a3fbfacdf71822980335a2de43608a9f749e3c32",
+  "base": "251892e223fca3bf5c90f060d3b9673683e258fa",
+  "tree": "9656d141ec23459b9c7867761ecf33d06c5d4f27",
+  "patch_sha256": "b911bb8a475dcf9e1c952aca8a2243ea71c0aa7eaf4e6972e1909e20e1726d64",
+  "source_files_sha256": {
+    "sdks/python-cli/README.md": "3ce9120a6b325bae15c9be2feb23d28dd14744646c3970a7889f3ef2c6b4e268",
+    "sdks/python-cli/omi_cli/output.py": "1dd4a698e0e209e45eb9163aca9dcae5fb2c521e2a98c7ace1a1e18bbec7658d",
+    "sdks/python-cli/tests/test_output_types.py": "9dc2e17de5c3d60b1c07100d9db9f665117019410c22710bd0e4bc19fe042604"
+  }
+}

@@ -1,0 +1,14 @@
+tree 9656d141ec23459b9c7867761ecf33d06c5d4f27
+parent 251892e223fca3bf5c90f060d3b9673683e258fa
+author ZhaZhaBei <203745378+ZhaZhaBei@users.noreply.github.com> 1792794773 +0800
+committer ZhaZhaBei <203745378+ZhaZhaBei@users.noreply.github.com> 1792794773 +0800
+
+fix(cli): preserve JSON value types in common result rendering
+
+Handle date, PurePath, UUID and unordered collections in the shared renderer.
+Sort original set members by their JSON representation instead of converting
+them to pretty text. Cover native types, nested models and hash-seed stability.
+
+Failure-Class: none
+
+AI-assisted implementation and verification with OpenAI Codex.
