@@ -24,6 +24,10 @@ jobs:
           persist-credentials: false
       - name: Checkout exact public PR base
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
         with:
           repository: ZhaZhaBei/omi
           ref: 7a1bacdb5b0217e24e04279dec913a39c2b28770
@@ -41,9 +45,11 @@ jobs:
         working-directory: source
         run: |
           python - <<'PYCODE'
-          import hashlib, os
+          import hashlib, os, subprocess
           from pathlib import Path
-          patch = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-package' / 'changes.patch'
+          package = Path(os.environ['GITHUB_WORKSPACE']) / 'ci-package'
+          patch = package / 'changes.patch'
+          patch.write_bytes(subprocess.check_output(['git', '-C', str(package), 'cat-file', 'blob', 'HEAD:changes.patch']))
           assert hashlib.sha256(patch.read_bytes()).hexdigest() == '4799f8d94a0a1eecd383922d38fce19b1881afae010cda4486497915855e4d25'
           PYCODE
           test "$(git rev-parse HEAD)" = '7a1bacdb5b0217e24e04279dec913a39c2b28770'
