@@ -14,7 +14,7 @@ jobs:
         shell: bash
         working-directory: source/sdks/python-cli
     env:
-      OMI_CONFIG: ${{ runner.temp }}/omi-cli-validation/config.toml
+      OMI_CONFIG: ${{ github.workspace }}/omi-cli-validation/config.toml
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout validation package
