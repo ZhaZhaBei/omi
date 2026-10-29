@@ -1,13 +1,13 @@
-name: Omi CLI Windows lock validation
+name: Omi CLI Linux lock validation
 on:
   push:
-    branches: [validation/omi-cli-lock-r86-20261029]
+    branches: [validation/omi-cli-lock-linux-r86-20261029]
 permissions:
   contents: read
 jobs:
-  windows:
-    name: Windows Python 3.12 synthetic lock regression and full suite
-    runs-on: windows-latest
+  linux:
+    name: Linux Python 3.12 lock regression and full suite
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
@@ -59,7 +59,15 @@ jobs:
           git diff --cached --check
       - name: Install declared test dependencies
         run: python -m pip install -e '.[dev]'
-      - name: Run targeted Windows locks
+      - name: Check formatting and types
+        run: |
+          python -m black --check omi_cli/config.py tests/test_windows_config_lock.py
+          python -m mypy omi_cli
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir "${RUNNER_TEMP}/omi-wheel"
+      - name: Run targeted lock regression
         run: python -m pytest -q -o addopts=--strict-markers tests/test_windows_config_lock.py tests/test_config_transactions.py
       - name: Run complete CLI suite with synthetic fixtures
         run: python -m pytest -q -o addopts=--strict-markers --basetemp "${RUNNER_TEMP}/omi-cli-pytest" --junitxml "${RUNNER_TEMP}/omi-cli-results.xml"
