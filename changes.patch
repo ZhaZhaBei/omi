@@ -1,344 +1,244 @@
-diff --git a/sdks/python-cli/omi_cli/config.py b/sdks/python-cli/omi_cli/config.py
-index b1a30b06..9d84734e 100644
---- a/sdks/python-cli/omi_cli/config.py
-+++ b/sdks/python-cli/omi_cli/config.py
-@@ -19,7 +19,6 @@ import math
+diff --git a/sdks/python-cli/tests/test_config_transactions.py b/sdks/python-cli/tests/test_config_transactions.py
+index cefd2e72d..9e052a60b 100644
+--- a/sdks/python-cli/tests/test_config_transactions.py
++++ b/sdks/python-cli/tests/test_config_transactions.py
+@@ -4,9 +4,10 @@ from __future__ import annotations
+ 
+ import json
  import os
- import secrets
++import queue
+ import subprocess
  import sys
 -import time
- from contextlib import contextmanager
- from dataclasses import dataclass, field
++import threading
  from pathlib import Path
-@@ -335,22 +334,70 @@ def _ensure_config_parent(path: Path) -> None:
-             pass
  
- 
-+def _windows_config_lock(fd: int, *, unlock: bool) -> None:
-+    """Lock or unlock byte zero on a synchronous Windows file descriptor.
-+
-+    LockFileEx without LOCKFILE_FAIL_IMMEDIATELY waits in the kernel rather
-+    than polling. The existing msvcrt implementation uses the same one-byte
-+    range, so a running older CLI and a newer CLI still coordinate. Because
-+    the Windows call is synchronous, Ctrl-C may not be observed until the
-+    waiting call returns; closing the descriptor releases any acquired lock.
-+    """
-+    import ctypes
-+    import msvcrt
-+    from ctypes import wintypes
-+
-+    # OVERLAPPED's internal fields are ULONG_PTR (pointer-sized), and its
-+    # offset is two DWORDs even on 64-bit Windows. Zero initialization gives
-+    # the same byte-zero lock range used by the earlier msvcrt implementation.
-+    class _Overlapped(ctypes.Structure):
-+        _fields_ = [
-+            ("Internal", ctypes.c_size_t),
-+            ("InternalHigh", ctypes.c_size_t),
-+            ("Offset", wintypes.DWORD),
-+            ("OffsetHigh", wintypes.DWORD),
-+            ("hEvent", wintypes.HANDLE),
-+        ]
-+
-+    # These attributes exist only on Windows; keep platform-independent type
-+    # checking of the rest of the CLI possible on non-Windows hosts.
-+    windows_ctypes: Any = ctypes
-+    windows_crt: Any = msvcrt
-+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
-+    overlapped = _Overlapped()
-+    handle = windows_crt.get_osfhandle(fd)
-+    if unlock:
-+        operation = kernel32.UnlockFileEx
-+        operation.argtypes = [
-+            wintypes.HANDLE,
-+            wintypes.DWORD,
-+            wintypes.DWORD,
-+            wintypes.DWORD,
-+            ctypes.POINTER(_Overlapped),
-+        ]
-+        operation.restype = wintypes.BOOL
-+        succeeded = operation(handle, 0, 1, 0, ctypes.byref(overlapped))
-+    else:
-+        operation = kernel32.LockFileEx
-+        operation.argtypes = [
-+            wintypes.HANDLE,
-+            wintypes.DWORD,
-+            wintypes.DWORD,
-+            wintypes.DWORD,
-+            wintypes.DWORD,
-+            ctypes.POINTER(_Overlapped),
-+        ]
-+        operation.restype = wintypes.BOOL
-+        # LOCKFILE_EXCLUSIVE_LOCK only: a synchronous handle waits in the
-+        # kernel when this byte is held by another process.
-+        succeeded = operation(handle, 0x00000002, 0, 1, 0, ctypes.byref(overlapped))
-+    if not succeeded:
-+        raise windows_ctypes.WinError(windows_ctypes.get_last_error())
-+
-+
- def _acquire_config_lock(fd: int) -> None:
-     if sys.platform == "win32":
--        import msvcrt
--
--        # Lock one byte at a fixed offset, including on a newly empty file.
--        # LK_LOCK stops retrying after ten seconds; keep waiting for this short
--        # local transaction instead, while leaving Ctrl-C interruptible.
--        while True:
--            os.lseek(fd, 0, os.SEEK_SET)
--            try:
--                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
--                return
--            except OSError as exc:
--                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
--                    raise
--                time.sleep(0.05)
-+        _windows_config_lock(fd, unlock=False)
-     else:
-         import fcntl
- 
-@@ -359,10 +406,7 @@ def _acquire_config_lock(fd: int) -> None:
- 
- def _release_config_lock(fd: int) -> None:
-     if sys.platform == "win32":
--        import msvcrt
--
--        os.lseek(fd, 0, os.SEEK_SET)
--        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-+        _windows_config_lock(fd, unlock=True)
-     else:
-         import fcntl
- 
-diff --git a/sdks/python-cli/tests/test_windows_config_lock.py b/sdks/python-cli/tests/test_windows_config_lock.py
-new file mode 100644
-index 00000000..0ae99d9a
---- /dev/null
-+++ b/sdks/python-cli/tests/test_windows_config_lock.py
-@@ -0,0 +1,229 @@
-+"""Test Windows configuration locks without touching a real Omi config."""
-+
-+from __future__ import annotations
-+
-+import ctypes
+ import pytest
+@@ -20,8 +21,8 @@ from omi_cli.main import app
+ # write; it does not fail merely because the new transaction API is absent.
+ _WRITER = r"""
+ import json
 +import os
-+import subprocess
-+import sys
-+import time
-+from pathlib import Path
-+from types import SimpleNamespace
-+
-+import pytest
-+
-+from omi_cli import config as cfg
-+
-+
-+class _FakeWinFunction:
-+    def __init__(self, result: int) -> None:
-+        self.result = result
-+        self.calls: list[tuple[object, ...]] = []
-+        self.argtypes: object = None
-+        self.restype: object = None
-+
-+    def __call__(self, *args: object) -> int:
-+        self.calls.append(args)
-+        return self.result
-+
-+
-+def test_windows_lock_uses_blocking_exclusive_byte_zero_and_matching_unlock(monkeypatch: pytest.MonkeyPatch) -> None:
-+    """Exercise API flags and the lock range even on non-Windows test hosts."""
-+    lock, unlock = _FakeWinFunction(1), _FakeWinFunction(1)
-+    kernel = SimpleNamespace(LockFileEx=lock, UnlockFileEx=unlock)
-+    monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(get_osfhandle=lambda fd: fd + 100))
-+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kwargs: kernel, raising=False)
-+
-+    cfg._windows_config_lock(7, unlock=False)
-+    cfg._windows_config_lock(7, unlock=True)
-+
-+    assert lock.calls[0][:5] == (107, 2, 0, 1, 0)  # exclusive, no fail-immediately, one byte
-+    assert unlock.calls[0][:4] == (107, 0, 1, 0)
-+    for args in (lock.calls[0], unlock.calls[0]):
-+        overlapped = args[-1]._obj  # type: ignore[attr-defined]
-+        assert overlapped.Offset == overlapped.OffsetHigh == 0
-+        assert not overlapped.hEvent
-+
-+
-+@pytest.mark.parametrize("unlock", [False, True], ids=["acquire", "release"])
-+def test_windows_lock_api_failure_is_propagated(monkeypatch: pytest.MonkeyPatch, unlock: bool) -> None:
-+    kernel = SimpleNamespace(LockFileEx=_FakeWinFunction(0), UnlockFileEx=_FakeWinFunction(0))
-+    monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(get_osfhandle=lambda fd: fd))
-+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kwargs: kernel, raising=False)
-+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
-+    monkeypatch.setattr(ctypes, "WinError", lambda code: OSError(code, "synthetic native failure"), raising=False)
-+
-+    with pytest.raises(OSError, match="synthetic native failure"):
-+        cfg._windows_config_lock(7, unlock=unlock)
-+
-+
-+def test_lock_acquisition_failure_does_not_read_or_write_config(
-+    monkeypatch: pytest.MonkeyPatch, config_path: Path
-+) -> None:
-+    """A failed lock must not fall through to an unprotected transaction."""
-+    original = b"[profiles.default]\napi_base = 'https://example.invalid'\n"
-+    config_path.write_bytes(original)
-+
-+    def fail(_fd: int) -> None:
-+        raise PermissionError("synthetic lock failure")
-+
-+    monkeypatch.setattr(cfg, "_acquire_config_lock", fail)
-+    with pytest.raises(PermissionError, match="synthetic lock failure"):
-+        with cfg.locked_config(config_path):
-+            pytest.fail("an unprotected transaction was entered")
-+    assert config_path.read_bytes() == original
-+
-+
-+# The native tests below run only on real Windows. Child processes receive a
-+# temporary HOME and explicit temporary OMI_CONFIG; they make no network calls.
-+_NATIVE_WAITER = r"""
-+import os, sys
-+from pathlib import Path
-+from omi_cli import config as cfg
-+lock_path, started, acquired = map(Path, sys.argv[1:])
-+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
-+try:
-+    started.write_text('started')
-+    cfg._acquire_config_lock(fd)
-+    try:
-+        acquired.write_text('acquired')
-+    finally:
-+        cfg._release_config_lock(fd)
-+finally:
-+    os.close(fd)
-+"""
-+
-+_NATIVE_HOLDER = r"""
-+import os, sys
-+from pathlib import Path
-+from omi_cli import config as cfg
-+lock_path, acquired = map(Path, sys.argv[1:])
-+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
-+try:
-+    cfg._acquire_config_lock(fd)
-+    acquired.write_text('acquired')
-+    sys.stdin.read()
-+finally:
-+    os.close(fd)
-+"""
-+
-+_LEGACY_PROBE = r"""
-+import errno, msvcrt, os, sys
-+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
-+try:
-+    os.lseek(fd, 0, os.SEEK_SET)
-+    try:
-+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-+    except OSError as exc:
-+        # Only the expected CRT lock-contention errors are evidence of mutual
-+        # exclusion; bad descriptors and unrelated failures must surface.
-+        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-+            raise
-+        sys.exit(42)
-+    os.lseek(fd, 0, os.SEEK_SET)
-+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-+finally:
-+    os.close(fd)
-+"""
-+
-+
-+def _child_env(tmp_path: Path) -> dict[str, str]:
-+    source = Path(cfg.__file__).resolve().parent.parent
-+    env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "WINDIR") if k in os.environ}
-+    env.update(
-+        HOME=str(tmp_path),
-+        USERPROFILE=str(tmp_path),
-+        OMI_CONFIG=str(tmp_path / "config.toml"),
-+        PYTHONPATH=str(source),
-+    )
-+    return env
-+
-+
-+def _wait_for_file(path: Path, child: subprocess.Popen[str]) -> None:
-+    deadline = time.monotonic() + 10
-+    while not path.exists():
-+        if child.poll() is not None:
-+            stdout, stderr = child.communicate(timeout=2)
-+            pytest.fail(f"child exited before {path.name}: {child.returncode}; {stdout}; {stderr}")
-+        if time.monotonic() >= deadline:
-+            pytest.fail(f"child did not produce {path.name}")
-+        time.sleep(0.01)
-+
-+
-+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows byte-range locks")
-+def test_windows_waits_beyond_crt_timeout_and_interoperates_with_legacy_lock(tmp_path: Path) -> None:
-+    import msvcrt
-+
-+    lock_path = tmp_path / "config.toml.lock"
-+    started, acquired = tmp_path / "started", tmp_path / "acquired"
-+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
-+    child: subprocess.Popen[str] | None = None
-+    locked = False
-+    try:
-+        os.lseek(fd, 0, os.SEEK_SET)
-+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-+        locked = True
-+        child = subprocess.Popen(
-+            [sys.executable, "-c", _NATIVE_WAITER, str(lock_path), str(started), str(acquired)],
-+            env=_child_env(tmp_path),
-+            stdout=subprocess.PIPE,
-+            stderr=subprocess.PIPE,
-+            text=True,
-+        )
-+        _wait_for_file(started, child)
-+        # The CRT's LK_LOCK gives up after about 10 one-second retries. Our
-+        # waiter must still be waiting while an older client holds that byte.
-+        with pytest.raises(subprocess.TimeoutExpired):
-+            child.wait(timeout=11)
-+        assert not acquired.exists()
-+        os.lseek(fd, 0, os.SEEK_SET)
-+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-+        locked = False
-+        stdout, stderr = child.communicate(timeout=10)
-+        assert child.returncode == 0, f"waiter failed: {stdout}; {stderr}"
-+        assert acquired.exists()
-+    finally:
-+        if child is not None and child.poll() is None:
-+            child.kill()
-+            child.communicate(timeout=5)
-+        if locked:
-+            os.lseek(fd, 0, os.SEEK_SET)
-+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-+        os.close(fd)
-+
-+
-+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows byte-range locks")
-+def test_windows_legacy_client_observes_lock_and_process_exit_releases_it(tmp_path: Path) -> None:
-+    lock_path, acquired = tmp_path / "config.toml.lock", tmp_path / "acquired"
-+    child = subprocess.Popen(
-+        [sys.executable, "-c", _NATIVE_HOLDER, str(lock_path), str(acquired)],
+ import sys
+-import time
+ from pathlib import Path
+ 
+ from typer.testing import CliRunner
+@@ -33,19 +34,19 @@ action = json.loads(sys.argv[1])
+ role = sys.argv[2]
+ barriers = Path(sys.argv[3])
+ original_save = cfg.save
++# CliRunner replaces sys.stdout; retain the original subprocess pipe for signals.
++signals = os.fdopen(os.dup(sys.stdout.fileno()), 'w', buffering=1)
++commands = os.fdopen(os.dup(sys.stdin.fileno()), 'r')
+ 
+ def controlled_save(config):
+-    (barriers / (role + '.saving')).write_text('ready')
++    print(role + '.saving', file=signals, flush=True)
+     if role == 'first':
+-        deadline = time.monotonic() + 15
+-        while not (barriers / 'release').exists():
+-            if time.monotonic() >= deadline:
+-                raise TimeoutError('parent did not release the writer')
+-            time.sleep(0.01)
++        if commands.readline().strip() != 'release':
++            raise RuntimeError('parent did not release the writer')
+     original_save(config)
+ 
+ cfg.save = controlled_save
+-(barriers / (role + '.entered')).write_text('ready')
++print(role + '.entered', file=signals, flush=True)
+ kind = action[0]
+ if kind == 'api-key':
+     profile_name = action[1] if len(action) > 1 else 'default'
+@@ -114,21 +115,27 @@ def _start_writer(action: list[str], role: str, barriers: Path, config_path: Pat
+         [sys.executable, "-c", _WRITER, json.dumps(action), role, str(barriers)],
+         cwd=source,
+         env=env,
 +        stdin=subprocess.PIPE,
-+        stdout=subprocess.PIPE,
-+        stderr=subprocess.PIPE,
-+        text=True,
-+        env=_child_env(tmp_path),
-+    )
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+         text=True,
+     )
+ 
+ 
+-def _wait_for_marker(path: Path, process: subprocess.Popen[str]) -> None:
+-    deadline = time.monotonic() + 10
+-    while not path.exists():
+-        if process.poll() is not None:
+-            stdout, stderr = process.communicate(timeout=2)
+-            pytest.fail(f"writer exited before {path.name}: {process.returncode}\n{stdout}\n{stderr}")
+-        if time.monotonic() >= deadline:
+-            pytest.fail(f"writer did not reach {path.name}")
+-        time.sleep(0.01)
++def _wait_for_signal(expected: str, process: subprocess.Popen[str]) -> None:
++    # A reader thread works with subprocess pipes on Windows and POSIX. The
++    # queue timeout bounds a stuck child; caller cleanup kills it on failure.
++    assert process.stdout is not None
++    signals: queue.Queue[str] = queue.Queue()
++    threading.Thread(target=lambda: signals.put(process.stdout.readline()), daemon=True).start()
 +    try:
-+        _wait_for_file(acquired, child)
-+        blocked = subprocess.run(
-+            [sys.executable, "-c", _LEGACY_PROBE, str(lock_path)],
-+            env=_child_env(tmp_path),
-+            capture_output=True,
-+            text=True,
-+            timeout=10,
-+        )
-+        assert blocked.returncode == 42, f"legacy lock was not blocked: {blocked.stdout}; {blocked.stderr}"
-+        child.kill()
-+        child.communicate(timeout=10)
-+        released = subprocess.run(
-+            [sys.executable, "-c", _LEGACY_PROBE, str(lock_path)],
-+            env=_child_env(tmp_path),
-+            capture_output=True,
-+            text=True,
-+            timeout=10,
-+        )
-+        assert released.returncode == 0, f"lock was not released: {released.stdout}; {released.stderr}"
-+    finally:
-+        if child.poll() is None:
-+            child.kill()
-+            child.communicate(timeout=5)
++        line = signals.get(timeout=10)
++    except queue.Empty:
++        pytest.fail(f"writer did not signal {expected}")
++    if not line:
++        stdout, stderr = process.communicate(timeout=2)
++        pytest.fail(f"writer exited before {expected}: {process.returncode}\n{stdout}\n{stderr}")
++    assert line.rstrip("\r\n") == expected
+ 
+ 
+ def _finish_writer(process: subprocess.Popen[str]) -> None:
+@@ -150,10 +157,11 @@ def _run_competing_mutations(config_path: Path, first_action: list[str], second_
+     try:
+         first = _start_writer(first_action, "first", barriers, config_path)
+         processes.append(first)
+-        _wait_for_marker(barriers / "first.saving", first)
++        _wait_for_signal("first.entered", first)
++        _wait_for_signal("first.saving", first)
+         second = _start_writer(second_action, "second", barriers, config_path)
+         processes.append(second)
+-        _wait_for_marker(barriers / "second.entered", second)
++        _wait_for_signal("second.entered", second)
+ 
+         # On the old implementation the second command acknowledges its write
+         # while the first still holds an older snapshot. With a transaction it
+@@ -166,7 +174,9 @@ def _run_competing_mutations(config_path: Path, first_action: list[str], second_
+         else:
+             _finish_writer(second)
+             assert (barriers / "second.done").exists()
+-        (barriers / "release").write_text("release")
++        assert first.stdin is not None
++        first.stdin.write("release\n")
++        first.stdin.flush()
+         _finish_writer(first)
+         _finish_writer(second)
+         assert (barriers / "first.done").exists()
+@@ -270,7 +280,8 @@ def test_process_exit_releases_transaction_without_committing(config_path: Path)
+     try:
+         first = _start_writer(["api-key"], "first", barriers, config_path)
+         processes.append(first)
+-        _wait_for_marker(barriers / "first.saving", first)
++        _wait_for_signal("first.entered", first)
++        _wait_for_signal("first.saving", first)
+         first.kill()
+         first.communicate(timeout=5)
+         second = _start_writer(
+diff --git a/sdks/python-cli/tests/test_windows_config_lock.py b/sdks/python-cli/tests/test_windows_config_lock.py
+index 0ae99d9a5..3fb4d17e8 100644
+--- a/sdks/python-cli/tests/test_windows_config_lock.py
++++ b/sdks/python-cli/tests/test_windows_config_lock.py
+@@ -4,9 +4,10 @@ from __future__ import annotations
+ 
+ import ctypes
+ import os
++import queue
+ import subprocess
+ import sys
+-import time
++import threading
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+@@ -80,10 +81,10 @@ _NATIVE_WAITER = r"""
+ import os, sys
+ from pathlib import Path
+ from omi_cli import config as cfg
+-lock_path, started, acquired = map(Path, sys.argv[1:])
++lock_path, acquired = map(Path, sys.argv[1:])
+ fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
+ try:
+-    started.write_text('started')
++    print('started', flush=True)
+     cfg._acquire_config_lock(fd)
+     try:
+         acquired.write_text('acquired')
+@@ -97,11 +98,11 @@ _NATIVE_HOLDER = r"""
+ import os, sys
+ from pathlib import Path
+ from omi_cli import config as cfg
+-lock_path, acquired = map(Path, sys.argv[1:])
++lock_path = Path(sys.argv[1])
+ fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0), 0o600)
+ try:
+     cfg._acquire_config_lock(fd)
+-    acquired.write_text('acquired')
++    print('acquired', flush=True)
+     sys.stdin.read()
+ finally:
+     os.close(fd)
+@@ -139,15 +140,20 @@ def _child_env(tmp_path: Path) -> dict[str, str]:
+     return env
+ 
+ 
+-def _wait_for_file(path: Path, child: subprocess.Popen[str]) -> None:
+-    deadline = time.monotonic() + 10
+-    while not path.exists():
+-        if child.poll() is not None:
+-            stdout, stderr = child.communicate(timeout=2)
+-            pytest.fail(f"child exited before {path.name}: {child.returncode}; {stdout}; {stderr}")
+-        if time.monotonic() >= deadline:
+-            pytest.fail(f"child did not produce {path.name}")
+-        time.sleep(0.01)
++def _wait_for_signal(expected: str, child: subprocess.Popen[str]) -> None:
++    # Windows subprocess pipes cannot be waited on with select(); a reader
++    # thread and bounded queue wait provide a portable child-ready handshake.
++    assert child.stdout is not None
++    signals: queue.Queue[str] = queue.Queue()
++    threading.Thread(target=lambda: signals.put(child.stdout.readline()), daemon=True).start()
++    try:
++        line = signals.get(timeout=10)
++    except queue.Empty:
++        pytest.fail(f"child did not signal {expected}")
++    if not line:
++        stdout, stderr = child.communicate(timeout=2)
++        pytest.fail(f"child exited before {expected}: {child.returncode}; {stdout}; {stderr}")
++    assert line.rstrip("\r\n") == expected
+ 
+ 
+ @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows byte-range locks")
+@@ -155,7 +161,7 @@ def test_windows_waits_beyond_crt_timeout_and_interoperates_with_legacy_lock(tmp
+     import msvcrt
+ 
+     lock_path = tmp_path / "config.toml.lock"
+-    started, acquired = tmp_path / "started", tmp_path / "acquired"
++    acquired = tmp_path / "acquired"
+     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+     child: subprocess.Popen[str] | None = None
+     locked = False
+@@ -164,13 +170,13 @@ def test_windows_waits_beyond_crt_timeout_and_interoperates_with_legacy_lock(tmp
+         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+         locked = True
+         child = subprocess.Popen(
+-            [sys.executable, "-c", _NATIVE_WAITER, str(lock_path), str(started), str(acquired)],
++            [sys.executable, "-c", _NATIVE_WAITER, str(lock_path), str(acquired)],
+             env=_child_env(tmp_path),
+             stdout=subprocess.PIPE,
+             stderr=subprocess.PIPE,
+             text=True,
+         )
+-        _wait_for_file(started, child)
++        _wait_for_signal("started", child)
+         # The CRT's LK_LOCK gives up after about 10 one-second retries. Our
+         # waiter must still be waiting while an older client holds that byte.
+         with pytest.raises(subprocess.TimeoutExpired):
+@@ -194,9 +200,9 @@ def test_windows_waits_beyond_crt_timeout_and_interoperates_with_legacy_lock(tmp
+ 
+ @pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows byte-range locks")
+ def test_windows_legacy_client_observes_lock_and_process_exit_releases_it(tmp_path: Path) -> None:
+-    lock_path, acquired = tmp_path / "config.toml.lock", tmp_path / "acquired"
++    lock_path = tmp_path / "config.toml.lock"
+     child = subprocess.Popen(
+-        [sys.executable, "-c", _NATIVE_HOLDER, str(lock_path), str(acquired)],
++        [sys.executable, "-c", _NATIVE_HOLDER, str(lock_path)],
+         stdin=subprocess.PIPE,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+@@ -204,7 +210,7 @@ def test_windows_legacy_client_observes_lock_and_process_exit_releases_it(tmp_pa
+         env=_child_env(tmp_path),
+     )
+     try:
+-        _wait_for_file(acquired, child)
++        _wait_for_signal("acquired", child)
+         blocked = subprocess.run(
+             [sys.executable, "-c", _LEGACY_PROBE, str(lock_path)],
+             env=_child_env(tmp_path),
